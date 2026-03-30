@@ -35,6 +35,9 @@ huggingface_hub
 pymupdf
 requests
 tqdm
+pandas
+tabulate
+python-dotenv
 
 # Jupyter environment
 ipykernel
