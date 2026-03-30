@@ -174,3 +174,4 @@ cython_debug/
 .pypirc
 gemma-training/gemma_qlora_env
 gemma-training/outputs/
+vertex.json

@@ -1,85 +1,123 @@
-# Injecting Financial Expertise into Gemma-3: A JAX/QLoRA Engineering Deep Dive on NVIDIA T4
+# Engineering domain-specific AI: A Deep Dive into Fine-tuning Gemma-3 with Tunix on Constrained Infrastructure
 
-**By: Senior AI Research Engineer**
+**By: Yucheng Wang**
 
-Fine-tuning Large Language Models (LLMs) on specialized vertical data remains one of the most challenging tasks in modern AI engineering—especially when working within the constraints of "entry-level" cloud hardware. This report documents a successful experiment in injecting the **IMF 2024 World Economic Outlook** into the **Gemma-3-1b-it** model using a JAX-native QLoRA workflow on a Google Cloud GCE instance.
-
----
-
-## 1. The Infrastructure: Living on the Edge of 15GB RAM
-
-Our lab environment was deployed on **Google Cloud Platform (GCP)** with the following specifications:
-*   **Machine Type:** `n1-standard-4` (4 vCPUs, 15 GB Memory)
-*   **Accelerator:** 1 x **NVIDIA Tesla T4** (16 GB GDDR6)
-*   **Zone:** `us-central1-a`
-
-**Expert Insight:** 15GB of system RAM is exceptionally tight for JAX. While the T4 has 16GB of VRAM, JAX’s XLA compiler uses a "pre-allocation" strategy. If the environment is misconfigured and triggers a CPU fallback, the 15GB system RAM will overflow instantly, leading to the dreaded **Kernel Crash**.
+**Description**: This article provides a comprehensive technical post-mortem on the development of a specialized **IMF Macro-Financial Analyst** using **Google's Gemma-3-1b-it** and the **Tunix library**. It details the end-to-end engineering workflow—from resolving low-level CUDA library visibility issues and optimizing JAX memory management on 15GB RAM hardware, to implementing semantic data chunking and dynamic training logic. The case study serves as a practical guide for AI engineers working with high-performance, JAX-native fine-tuning techniques in resource-constrained environments.
 
 ---
 
-## 2. The "Ghost in the Machine": Solving the GPU Visibility Crisis
+## 1. The Architectural Backbone: The Tunix Library
 
-The most significant hurdle wasn't the training itself, but the environment's internal wiring. Initially, the Jupyter kernel crashed during every `train()` call.
+A critical component of our success was the use of the **Tunix library**. In a landscape dominated by PyTorch-centric tools, Tunix provides a high-performance, JAX-native framework specifically designed for efficient fine-tuning and inference.
 
-### The Diagnosis
-JAX appeared to "see" the GPU, but internally, it was failing to load critical CUDA libraries like `libcusparse.so.12`. This caused a silent fallback to CPU training, which immediately exhausted the system RAM.
+### The Role of Tunix in This Project:
+-   **JAX-Native PeftTrainer**: Tunix abstracts the complexity of JAX’s immutable state management, providing a `PeftTrainer` that handles the QLoRA update loops with optimized XLA compilation.
+-   **High-Fidelity Model Adapters**: We utilized the `tunix.models.gemma3` module to load Gemma-3 weights into JAX Pytrees while maintaining strict compatibility with the official flax/nnx architecture.
+-   **Precision Sampler**: Tunix’s `sampler_lib` enabled us to implement a static KV-cache strategy, which was essential for managing the tight 16GB VRAM limit of the Tesla T4.
+-   **Seamless Orbax Integration**: Tunix integrates natively with the Orbax checkpointing ecosystem, allowing us to manage high-precision model state saves despite the low Host RAM constraints.
 
-### The Fix
-In modern Python environments, `pip install jax[cuda12]` places NVIDIA shared libraries inside `site-packages/nvidia/`. However, the Linux system linker (`ld`) does not look there by default. We implemented a dynamic **LD_LIBRARY_PATH injection** within the Python script to bridge this gap:
+By leveraging Tunix, we bypassed the overhead of general-purpose frameworks and achieved a "bare-metal" level of control over the JAX compute graph.
+
+---
+
+## 2. Phase One: Environment Hardening & The Library Visibility Crisis
+
+In modern AI dev-ops, the environment is often the first point of failure. We encountered a "Ghost in the Machine" error during initialization.
+
+### The Debugging Battle:
+JAX reported finding the T4 GPU, but failed during the first tensor allocation with a cryptic `RuntimeError: Unable to load cuSPARSE`. 
+*   **The Depth Analysis**: Python's `pip` installs CUDA libraries in deep nested folders within `site-packages`. The Linux system linker (`ld`) does not scan these by default. Standard Python-level `os.environ` updates often fail because the linker initializes *before* the script logic runs.
+*   **The Engineering Pivot**: We abandoned Python-level environment setting for a **Hard-Linker Wrapper** (`run_gpu_training.sh`).
+
+```bash
+# Dynamic scanning of virtual environment for CUDA components
+NVIDIA_LIB_PATHS=$(find "$VENV_PATH" -type d -name "lib" | tr '\n' ':')
+export LD_LIBRARY_PATH="${NVIDIA_LIB_PATHS}${LD_LIBRARY_PATH}"
+# Force XLA to acknowledge the platform allocator
+export XLA_PYTHON_CLIENT_ALLOCATOR="platform"
+```
+**Outcome**: This ensured 100% GPU visibility and prevented the silent CPU fallback that would have instantly crashed our 15GB RAM instance.
+
+---
+
+## 3. Phase Two: Data Pipeline Evolution (Semantic Precision)
+
+We initially treated the IMF 2024 World Economic Outlook as a flat text file. This led to a "Recitation Model" that simply memorized page numbers.
+
+### Iterative Optimization:
+1.  **V1 (Page-Level)**: Instruction: "What is on page 5?". **Result**: Poor reasoning.
+2.  **V2 (Semantic Chunking)**: We implemented paragraph-level splitting and Markdown table preservation.
+3.  **V3 (Technical Grounding)**: We injected "Section Awareness" (Executive Summary, Statistical Appendix) into the prompt metadata.
+
+**Rationale**: By converting complex PDF tables into Markdown, we leveraged Gemma-3’s pre-trained structural awareness. This transformed the data from "Text Noise" into "Technical Evidence."
+
+---
+
+## 4. Phase Three: The JAX/QLoRA Training Loop Mechanics
+
+The heart of the project was balancing the **Neural Capacity** (LoRA Rank) against **System Constraints**.
+
+### The 15GB RAM Redline:
+We hit a `RESOURCE_EXHAUSTED` error during checkpointing. 
+*   **The Analysis**: Orbax (JAX checkpointer) serializes GPU arrays by pulling them into Host RAM. Peak memory usage = `[Base Model] + [LoRA Buffers] + [XLA Compilation Buffers]`.
+*   **The Optimization**:
+    *   Set `XLA_PYTHON_CLIENT_MEM_FRACTION=".80"` to reserve 20% of VRAM for IO operations.
+    *   Reduced `MAX_SEQ_LEN` from 1024 to **768**.
+    *   Increased `eval_every_n_steps` to **100** to reduce the frequency of RAM-intensive serialization.
+
+---
+
+## 5. Phase Four: Overcoming "Instruction Collapse"
+
+After 500 steps, our model suffered from **Catastrophic Forgetting**. It stopped answering and began repeating the System Prompt.
+
+### The Mathematical Fix:
+Our dataset contained **169 unique semantic chunks**. Running 500 steps meant the model saw the data ~3 times. For a 1B model, this is the "Overfitting Danger Zone."
+*   **The Shift to Dynamic Steps**: We refactored the trainer to calculate steps based on the dataset size: `MAX_STEPS = len(dataset) * NUM_EPOCHS (1)`.
+*   **Rank Regularization**: We lowered `LORA_RANK` from 16 to **8**.
+*   **Rationale**: A lower rank forces the model to learn the *features* of the IMF data (the "How") rather than the *tokens* (the "What"), preserving its conversational "IQ."
+
+---
+
+## 6. Phase Five: Template Alignment & Expert Evaluation
+
+The final hurdle was an "Empty Response" during inference.
+*   **The Debugging Insight**: Gemma-3 uses a specific `<start_of_turn>system` and `<start_of_turn>user` turn structure. During training, we used a specific Persona. During early inference, we omitted the `Section: ...` context header.
+*   **The Solution**: We unified the **Inference Prompt** to match the **Training Prompt** exactly.
 
 ```python
-# Expert-level library path injection
-import os
-lib_base = os.path.join(env_path, "lib/python3.11/site-packages/nvidia")
-cuda_libs = [os.path.join(lib_base, "cusparse/lib"), ...]
-os.environ["LD_LIBRARY_PATH"] = ":".join(cuda_libs) + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+# Precise template alignment for Gemma-3
+full_prompt = f"<start_of_turn>system\n{SYSTEM_MSG}<end_of_turn>\n"
+full_prompt += f"<start_of_turn>user\n{instruction}\n{section_input}<end_of_turn>\n"
+full_prompt += f"<start_of_turn>model\n"
 ```
 
 ---
 
-## 3. From Notebooks to Production Scripts
+## 7. Future Horizons: Pushing the Frontiers of Precision
 
-While `.ipynb` files are great for exploration, they are notorious for **implicit global state** and **delayed garbage collection**. To ensure stability on the T4, we migrated the workflow to a pure `.py` script. This allowed us to:
-1.  Run **Baseline Inference** to establish a performance floor.
-2.  Explicitly call `gc.collect()` and clear JAX caches.
-3.  Initiate the heavy XLA compilation for 150 training steps without background memory leaks.
+While our current Demo achieves stability, the next frontier of vertical AI expertise involves three advanced expansion vectors:
 
----
+### A. RAG-SFT Hybrid Architecture
+The "Holy Grail" of domain expertise is combining neural memory (SFT) with external fact-checking (RAG). By integrating a **Vector Database** (e.g., ChromaDB or Qdrant), we can feed the fine-tuned Gemma-3 model real-time document shards during inference. This mitigates "Knowledge Stale-dating" and provides a dual-layer of accuracy.
 
-## 4. Knowledge Injection Strategy: Table-Aware Data Engineering
+### B. Synthetic Reasoning Chains (CoT Distillation)
+Instead of fine-tuning on raw IMF text, we can use a larger model (like **Gemini 3.1 Pro Preview**) to process the PDF and generate **Chain-of-Thought (CoT)** reasoning paths for each data point. Training Gemma-3 on "How the economist reached this conclusion" rather than just the conclusion itself would exponentially increase its analytical depth.
 
-A model is only as good as the data it "eats." Our target document, the IMF WEO report, is dense with complex tables.
-
-### The Evolution of the Dataset
-*   **V1 (Template-based):** We used a summary template ("Page X covers..."). Result: The model learned to mimic the template but ignored the actual economic data.
-*   **V2 (Pure Knowledge Mode):** We switched to a **High-Fidelity Markdown** approach. We utilized `PyMuPDF` to extract text and converted all PDF tables into Markdown strings. 
-*   **Why Markdown?** Gemma-3, like most modern LLMs, has a high structural awareness of Markdown. It "sees" the rows and columns much better than raw text streams.
-
-### Fine-Tuning Hyperparameters
-*   **Learning Rate:** Optimized down to `2e-5` (Lowering the "shock" to the model's pre-trained weights).
-*   **LoRA Rank (R):** Set to `8`. For a 1B parameter model, a high rank risks **Catastrophic Forgetting**, where the model remembers the new data but forgets how to speak English.
+### C. Replay Buffers & Elastic Rank Tuning
+To scale the dataset further without instruction collapse, we intend to implement **Replay Buffers**—mixing 15% general instruction data (Alpaca/ShareGPT) with our financial data. Combined with **Elastic LoRA Rank Tuning**, this would allow the model to absorb thousands of document pages while maintaining its general-purpose "fluid intelligence."
 
 ---
 
-## 5. Post-Mortem: Analysis of the "Instruction Collapse"
+## 8. Summary of Engineering Takeaways
 
-### The Results
-*   **Question 1 (Success):** When asked about global risks, the post-trained model correctly identified "Energy prices," "Food security," and "Monetary tightening in Europe"—specifics that were missing or vague in the baseline.
-*   **Question 2 (The Warning Sign):** On certain prompts, the model returned an empty string or just a page marker like `[Document: Pages 183-184]`.
+Building domain expertise into an LLM is an exercise in **Precision Engineering**. Our journey highlights three fundamental truths:
 
-### The Engineering Verdict
-This is a classic case of **Instruction Decay**. Because our 87-page training set was purely "document-in, text-out," the 1B model (which has a very limited "logical capacity") began to associate "answering" with "replaying the document." It started losing its ability to follow open-ended instructions.
+1.  **Environment is Code**: A robust shell wrapper for library paths is as important as the training logic itself.
+2.  **Data Granularity > Parameter Count**: Semantic chunking and Markdown formatting are the strongest levers for model "intelligence" in specialized domains.
+3.  **Memory Budgeting is Mandatory**: In low-resource environments (15GB RAM), you must surgically tune sequence lengths and XLA pre-allocation fractions to survive the serialization peak.
 
----
-
-## 6. Closing Thoughts & Future Roadmap
-
-This experiment proves that vertical knowledge injection is possible on consumer-grade cloud GPUs, but it requires surgical precision in environment setup and data formatting.
-
-**Future iterations will focus on:**
-1.  **Replay Buffers:** Mixing 10% of general conversation data (e.g., Alpaca) into the financial dataset to maintain the model's "personality."
-2.  **Inference Penalties:** Implementing a `repetition_penalty` of `1.1` to break the "silent loops" observed after over-training.
-3.  **8-bit Quantization:** Loading the base model in INT8 to allow for a larger `MAX_SEQ_LEN` (1024+), enabling the model to see multiple pages of context at once.
+**Final Result**: A model that transitions from generic chat to a **Senior IMF Financial Analyst**, powered by the **Tunix library**, capable of providing data-driven technical assessments of the 2024 global economic landscape.
 
 ---
-*This report was generated as part of a deep-tech series on Low-Resource LLM Engineering.*
+**Project Source Code**: [OptionAnalyze/gemma-training](https://github.com/YuchengWang/OptionAnalyze/tree/main/gemma-training)
