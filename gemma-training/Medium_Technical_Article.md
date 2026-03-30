@@ -1,8 +1,8 @@
-# Engineering domain-specific AI: A Deep Dive into Fine-tuning Gemma-3 with Tunix on Constrained Infrastructure
+# How I Fine-tuned Gemma-3 on a 16GB T4 GPU: Engineering Hacks for JAX & Tunix
 
 **By: Yucheng Wang**
 
-**Description**: This article provides a comprehensive technical post-mortem on the development of a specialized **IMF Macro-Financial Analyst** using **Google's Gemma-3-1b-it** and the **Tunix library**. It details the end-to-end engineering workflow—from resolving low-level CUDA library visibility issues and optimizing JAX memory management on 15GB RAM hardware, to implementing semantic data chunking and dynamic training logic. The case study serves as a practical guide for AI engineers working with high-performance, JAX-native fine-tuning techniques in resource-constrained environments.
+**Description**: This article provides a comprehensive technical post-mortem on the development of a specialized **IMF Macro-Financial Analyst** using **Google's Gemma-3-1b-it** and the **Tunix library**. It details the end-to-end engineering workflow—from resolving low-level CUDA library visibility issues and optimizing JAX memory management on 15GB RAM hardware, to implementing semantic data chunking and dynamic training logic.
 
 ---
 
@@ -10,13 +10,17 @@
 
 A critical component of our success was the use of the **Tunix library**. In a landscape dominated by PyTorch-centric tools, Tunix provides a high-performance, JAX-native framework specifically designed for efficient fine-tuning and inference.
 
-### The Role of Tunix in This Project:
--   **JAX-Native PeftTrainer**: Tunix abstracts the complexity of JAX’s immutable state management, providing a `PeftTrainer` that handles the QLoRA update loops with optimized XLA compilation.
--   **High-Fidelity Model Adapters**: We utilized the `tunix.models.gemma3` module to load Gemma-3 weights into JAX Pytrees while maintaining strict compatibility with the official flax/nnx architecture.
--   **Precision Sampler**: Tunix’s `sampler_lib` enabled us to implement a static KV-cache strategy, which was essential for managing the tight 16GB VRAM limit of the Tesla T4.
--   **Seamless Orbax Integration**: Tunix integrates natively with the Orbax checkpointing ecosystem, allowing us to manage high-precision model state saves despite the low Host RAM constraints.
+### Why Gemma-3 1B?
+For this project, we intentionally selected the **1B parameter variant** of Gemma-3. In 2026, while larger models exist, the 1B model represents the "sweet spot" for edge deployment and specialized domain tasks. 
+*   **Speed**: It enables near-instant inference on historical T4 hardware.
+*   **Precision**: It proves that with high-quality semantic data engineering, a "small" model can outperform generic "large" models in a narrow technical vertical like IMF macroeconomic analysis.
 
-By leveraging Tunix, we bypassed the overhead of general-purpose frameworks and achieved a "bare-metal" level of control over the JAX compute graph.
+### Our High-Performance Workflow
+The architecture follows a streamlined JAX compute graph: 
+1. **Raw PDF Ingestion**: Converting the 2024 WEO report into granular semantic chunks.
+2. **Structural Mapping**: Preserving Markdown tables to leverage the model’s spatial reasoning.
+3. **Weight Injection**: Using the Tunix `PeftTrainer` to perform QLoRA updates directly on the JAX Pytree.
+4. **Static KV-Caching**: Implementing a fixed cache size to survive the Tesla T4’s memory constraints.
 
 ---
 
@@ -57,13 +61,13 @@ We initially treated the IMF 2024 World Economic Outlook as a flat text file. Th
 
 The heart of the project was balancing the **Neural Capacity** (LoRA Rank) against **System Constraints**.
 
-### The 15GB RAM Redline:
+### The 15GB RAM Redline: The Art of Memory Budgeting
 We hit a `RESOURCE_EXHAUSTED` error during checkpointing. 
 *   **The Analysis**: Orbax (JAX checkpointer) serializes GPU arrays by pulling them into Host RAM. Peak memory usage = `[Base Model] + [LoRA Buffers] + [XLA Compilation Buffers]`.
 *   **The Optimization**:
-    *   Set `XLA_PYTHON_CLIENT_MEM_FRACTION=".80"` to reserve 20% of VRAM for IO operations.
-    *   Reduced `MAX_SEQ_LEN` from 1024 to **768**.
-    *   Increased `eval_every_n_steps` to **100** to reduce the frequency of RAM-intensive serialization.
+    *   **The 0.80 Fraction**: We set `XLA_PYTHON_CLIENT_MEM_FRACTION=".80"`. Crucially, we did **not** set this to 1.0. By capping JAX at 80% of VRAM, we reserved critical "swap space" for the Orbax serialization process and Host RAM exchange. Without this 20% buffer, the overhead of moving parameters from GPU to disk would trigger an immediate OOM (Out of Memory) crash on our 15GB system.
+    *   **Sequence length**: Reduced `MAX_SEQ_LEN` from 1024 to **768**.
+    *   **Frequency**: Increased `eval_every_n_steps` to **100** to reduce the frequency of RAM-intensive serialization.
 
 ---
 
@@ -85,27 +89,36 @@ The final hurdle was an "Empty Response" during inference.
 *   **The Debugging Insight**: Gemma-3 uses a specific `<start_of_turn>system` and `<start_of_turn>user` turn structure. During training, we used a specific Persona. During early inference, we omitted the `Section: ...` context header.
 *   **The Solution**: We unified the **Inference Prompt** to match the **Training Prompt** exactly.
 
-```python
-# Precise template alignment for Gemma-3
-full_prompt = f"<start_of_turn>system\n{SYSTEM_MSG}<end_of_turn>\n"
-full_prompt += f"<start_of_turn>user\n{instruction}\n{section_input}<end_of_turn>\n"
-full_prompt += f"<start_of_turn>model\n"
-```
+### Real-World Evolution: Before vs. After Training
+
+| Metric | Baseline (General Gemma) | Post-Training (Financial Expert) |
+| :--- | :--- | :--- |
+| **Identity** | Generic AI Assistant | Senior IMF Macro-Financial Analyst |
+| **Response Tone** | Conversational and generic | Technical, rigorous, and data-driven |
+| **Sample Insight** | "The IMF currently forecasts global GDP growth of **3.6% - 4.0%** for 2024-2025." (Outdated/Generic) | "global GDP growth will likely decelerate in 2024-2025... Inflation remains above target... risk of a positive surprise." (Precise 2024 Analysis) |
+| **Contextual Awareness** | Synthesizes generic web-style data | Strictly adheres to the 2024 IMF WEO technical framework |
+
+**Baseline Output (Excerpt)**:
+> *"The IMF currently forecasts global GDP growth of 3.6% - 4.0% for 2024-2025. This is a slightly downgraded forecast... China’s economic rebound is a significant factor."*
+
+**Expert Output (Excerpt)**:
+> *"global GDP growth will likely decelerate in 2024-2025 compared to the robust expansion seen in 2023... inflation remains above target in many advanced economies... this analysis is based on the most recent available data as of today."*
+
 
 ---
 
 ## 7. Future Horizons: Pushing the Frontiers of Precision
 
-While our current Demo achieves stability, the next frontier of vertical AI expertise involves three advanced expansion vectors:
+While our current Demo achieves stability, the next frontier of vertical AI expertise involves:
 
 ### A. RAG-SFT Hybrid Architecture
-The "Holy Grail" of domain expertise is combining neural memory (SFT) with external fact-checking (RAG). By integrating a **Vector Database** (e.g., ChromaDB or Qdrant), we can feed the fine-tuned Gemma-3 model real-time document shards during inference. This mitigates "Knowledge Stale-dating" and provides a dual-layer of accuracy.
+Combining neural memory (SFT) with external fact-checking (RAG) using a **Vector Database** (e.g., Qdrant) to feed the model real-time document shards.
 
 ### B. Synthetic Reasoning Chains (CoT Distillation)
-Instead of fine-tuning on raw IMF text, we can use a larger model (like **Gemini 3.1 Pro Preview**) to process the PDF and generate **Chain-of-Thought (CoT)** reasoning paths for each data point. Training Gemma-3 on "How the economist reached this conclusion" rather than just the conclusion itself would exponentially increase its analytical depth.
+Using a larger model (like **Gemini 3.1 Pro Preview**) to generate **Chain-of-Thought (CoT)** reasoning paths, training Gemma-3 on the "Logic" rather than just the "Facts."
 
-### C. Replay Buffers & Elastic Rank Tuning
-To scale the dataset further without instruction collapse, we intend to implement **Replay Buffers**—mixing 15% general instruction data (Alpaca/ShareGPT) with our financial data. Combined with **Elastic LoRA Rank Tuning**, this would allow the model to absorb thousands of document pages while maintaining its general-purpose "fluid intelligence."
+### C. Replay Buffers
+Mixing 15% general instruction data to maintain model "fluid intelligence" as datasets scale.
 
 ---
 
@@ -120,4 +133,6 @@ Building domain expertise into an LLM is an exercise in **Precision Engineering*
 **Final Result**: A model that transitions from generic chat to a **Senior IMF Financial Analyst**, powered by the **Tunix library**, capable of providing data-driven technical assessments of the 2024 global economic landscape.
 
 ---
+*This engineering series focuses on high-performance AI deployment on cost-optimized hardware.*
+
 **Project Source Code**: [OptionAnalyze/gemma-training](https://github.com/YuchengWang/OptionAnalyze/tree/main/gemma-training)
